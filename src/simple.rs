@@ -109,17 +109,7 @@ impl EGraph {
         println!("{:d$}subst: {subst:?}", "", d = depth * 2,);
         println!("{:d$}matching {pat:?} at {class:?}", "", d = depth * 2,);
         match pat {
-            Sexp::Atom(name) => {
-                if let Some(id) = subst.get(*name) {
-                    if self.is_eq(id, class) {
-                        return vec![subst];
-                    } else {
-                        return vec![];
-                    }
-                } else {
-                    return vec![subst.with(*name, class)];
-                }
-            }
+            Sexp::Atom(name) => subst.with(*name, class).into_iter().collect(),
             Sexp::List(items) => {
                 let Some((Sexp::Atom(f), args)) = items.split_first() else {
                     panic!("expected atom at head of list");

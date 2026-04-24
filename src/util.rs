@@ -1,9 +1,12 @@
 /*
 Common, mostly uninteresting utilities used across the codebase.
  */
-use std::{collections::HashMap, ffi::OsStr, str::FromStr};
+use std::{ffi::OsStr, str::FromStr};
 
 pub use symbol_table::GlobalSymbol as Symbol;
+
+pub type IndexSet<K> = indexmap::IndexSet<K, rustc_hash::FxBuildHasher>;
+pub type IndexMap<K, V> = indexmap::IndexMap<K, V, rustc_hash::FxBuildHasher>;
 
 pub fn var_parse_or<T: FromStr>(key: impl AsRef<OsStr>, default: T) -> T
 where
@@ -43,39 +46,54 @@ where
     a
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Subst(HashMap<Symbol, Id>);
+#[derive(Debug, Clone, Default)]
+pub struct Subst(smallvec::SmallVec<[(Symbol, Id); 4]>);
+
+impl PartialEq for Subst {
+    fn eq(&self, other: &Self) -> bool {
+        if self.0.len() != other.0.len() {
+            return false;
+        }
+        self.0
+            .iter()
+            .all(|(name, id)| other.get(*name) == Some(*id))
+    }
+}
+
+impl Eq for Subst {}
 
 impl Subst {
-    pub fn with(&self, var: Symbol, id: Id) -> Self {
-        let mut new = self.clone();
-        new.0.insert(var, id);
-        new
+    fn get_ref(&self, name: Symbol) -> Option<&Id> {
+        self.0
+            .iter()
+            .find_map(|(n, id)| if *n == name { Some(id) } else { None })
+    }
+
+    pub fn with(&self, var: Symbol, id: Id) -> Option<Self> {
+        match self.get_ref(var) {
+            Some(old) if *old == id => Some(self.clone()),
+            Some(_) => None,
+            None => {
+                let mut new = self.clone();
+                new.0.push((var, id));
+                Some(new)
+            }
+        }
     }
 
     pub fn singleton(var: Symbol, id: Id) -> Self {
-        Self::default().with(var, id)
+        Self::default().with(var, id).unwrap()
     }
 
-    pub fn join(&self, other: &Self) -> Option<Self> {
-        let mut new = self.clone();
-        for (&var, &id) in &other.0 {
-            let old_id = new.0.insert(var, id);
-            if let Some(old_id) = old_id
-                && old_id != id
-            {
-                return None;
-            }
+    pub fn join(mut self, other: &Self) -> Option<Self> {
+        for (var, id) in &other.0 {
+            self = self.with(*var, *id)?;
         }
-        Some(new)
-    }
-
-    pub fn add(&self, var: impl Into<Symbol>, id: Id) -> Self {
-        self.join(&Subst::singleton(var.into(), id)).unwrap()
+        Some(self)
     }
 
     pub fn get(&self, name: Symbol) -> Option<Id> {
-        self.0.get(&name).copied()
+        self.get_ref(name).copied()
     }
 }
 
@@ -91,7 +109,7 @@ impl std::ops::Index<Symbol> for Subst {
     type Output = Id;
 
     fn index(&self, index: Symbol) -> &Id {
-        &self.0[&index]
+        self.get_ref(index).unwrap()
     }
 }
 
@@ -102,15 +120,6 @@ pub fn subst(var: impl Into<Symbol>, value: usize) -> Subst {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn subst_add_merges_compatible_bindings() {
-        let left = subst("x", 0);
-        let added = left.add("y", Id::new(1));
-        let expected = subst("x", 0) + subst("y", 1);
-
-        assert_eq!(added, expected);
-    }
 
     #[test]
     fn subst_join_rejects_conflict() {

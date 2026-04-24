@@ -5,8 +5,6 @@ An e-graph impl with acyclic union nodes, curried functions,
 
 */
 
-use indexmap::IndexSet;
-
 use crate::sexp::{self, Sexp};
 use crate::util::*;
 
@@ -37,6 +35,23 @@ impl UnionFind {
         a
     }
 
+    fn find_mut(&mut self, mut a: Id) -> Id {
+        // First walk to the root.
+        let mut root = a;
+        while root != self.parent[root.usize()] {
+            root = self.parent[root.usize()];
+        }
+
+        // Then compress the full traversed path to the root.
+        while a != root {
+            let next = self.parent[a.usize()];
+            self.parent[a.usize()] = root;
+            a = next;
+        }
+
+        root
+    }
+
     pub fn mkset(&mut self) -> Id {
         let id = Id::new(self.parent.len());
         self.parent.push(id);
@@ -44,25 +59,31 @@ impl UnionFind {
     }
 
     pub fn reparent(&mut self, a: Id, new_parent: Id) {
-        let a = self.find(a);
+        let a = self.find_mut(a);
         self.parent[a.usize()] = new_parent;
     }
 }
 
 impl Context {
     pub fn add_expr(&mut self, expr: Expr) -> Id {
-        if let Some((id, _expr)) = self.hashcons.get_full(&expr) {
+        let expr = match expr {
+            Expr::Pair(a, b) => Expr::Pair(self.uf.find_mut(a), self.uf.find_mut(b)),
+            Expr::Union(a, b) => Expr::Union(self.uf.find_mut(a), self.uf.find_mut(b)),
+            x => x,
+        };
+        let id = if let Some((id, _expr)) = self.hashcons.get_full(&expr) {
             Id::new(id)
         } else {
             let id = Id::new(self.hashcons.len());
             self.hashcons.insert(expr);
             assert_eq!(id, self.uf.mkset());
             id
-        }
+        };
+        self.uf.find_mut(id)
     }
 
     pub fn add_sexp(&mut self, sexp: &Sexp) -> Id {
-        match sexp {
+        let id = match sexp {
             Sexp::Atom(s) if s.as_str().starts_with('?') => self.add_expr(Expr::Var(*s).into()),
             Sexp::Atom(s) => self.add_expr(Expr::Const(*s)),
             Sexp::List(items) => {
@@ -70,13 +91,16 @@ impl Context {
                 let mut acc = self.add_sexp(first);
                 for sexp in rest {
                     let id = self.add_sexp(sexp);
+                    let id = self.uf.find_mut(id);
                     acc = self.add_expr(Expr::Pair(acc, id));
                 }
                 acc
             }
-        }
+        };
+        self.uf.find_mut(id)
     }
 
+    /// Parses and adds an s-expression
     pub fn add(&mut self, s: &str) -> Id {
         self.add_sexp(&s.parse().unwrap())
     }
@@ -88,8 +112,8 @@ impl Context {
     }
 
     pub fn union(&mut self, target: Id, rewritten: Id) -> Id {
-        let target = self.uf.find(target);
-        let rewritten = self.uf.find(rewritten);
+        let target = self.uf.find_mut(target);
+        let rewritten = self.uf.find_mut(rewritten);
         if target == rewritten {
             target
         } else {
@@ -105,37 +129,51 @@ impl Context {
     }
 
     pub fn matches(&self, pattern_id: Id, target_id: Id) -> Vec<Subst> {
-        use Expr::*;
-        let pattern = self.get(pattern_id);
-        let target = self.get(target_id);
-        match (pattern, target) {
-            (Var(name), _) => vec![Subst::singleton(*name, target_id)],
-            (Union(_, _), _) => panic!("can't match with union"),
-            // this could be a nice optimization, but it messes up
-            // when target includes variables
-            // _ if pattern == target => vec![Subst::default()],
-            (Const(a), Const(b)) if a == b => vec![Subst::default()],
-            (_, Union(a, b)) => append(self.matches(pattern_id, *a), self.matches(pattern_id, *b)),
-            (Pair(a1, b1), Pair(a2, b2)) => self
-                .matches(*a1, *a2)
-                .into_iter()
-                .flat_map(|a_subst| self.matches_with(*b1, *b2, a_subst))
-                .collect(),
-            _ => vec![],
-        }
+        let mut out = vec![];
+        self.matches_with(pattern_id, target_id, &[Subst::default()], &mut out);
+        out
     }
 
-    pub fn matches_with(&self, pattern: Id, target: Id, subst: Subst) -> Vec<Subst> {
-        self.matches(pattern, target)
-            .into_iter()
-            .filter_map(|s| s.join(&subst))
-            .collect()
+    pub fn matches_with(
+        &self,
+        pattern_id: Id,
+        target_id: Id,
+        substs: &[Subst],
+        out: &mut Vec<Subst>,
+    ) {
+        use Expr::*;
+        let pattern = self.get(pattern_id);
+        let mut todo = vec![target_id];
+        let mut seen = IndexSet::default();
+        while let Some(target_id) = todo.pop() {
+            if !seen.insert(target_id) {
+                continue;
+            }
+            let target = self.get(target_id);
+            match (pattern, target) {
+                (Var(name), _) => out.extend(substs.iter().flat_map(|s| s.with(*name, target_id))),
+                (Union(_, _), _) => panic!("can't match with union"),
+                // this could be a nice optimization, but it messes up
+                // when target includes variables
+                // _ if pattern == target => vec![Subst::default()],
+                (Const(a), Const(b)) if a == b => out.extend(substs.iter().cloned()),
+                (_, Union(a, b)) => {
+                    todo.extend([*a, *b]);
+                }
+                (Pair(a1, b1), Pair(a2, b2)) => {
+                    let mut left = vec![];
+                    self.matches_with(*a1, *a2, substs, &mut left);
+                    self.matches_with(*b1, *b2, &left, out);
+                }
+                _ => {}
+            }
+        }
     }
 
     pub fn instantiate(&mut self, pattern_id: Id, subst: &Subst) -> Id {
         let pattern = self.get(pattern_id).clone();
         match pattern {
-            Expr::Var(name) => subst[name],
+            Expr::Var(name) => self.uf.find_mut(subst[name]),
             Expr::Union(_, _) => panic!("can't instantiate union"),
             Expr::Pair(a, b) => {
                 let a = self.instantiate(a, subst);
@@ -146,6 +184,155 @@ impl Context {
         }
     }
 
+    pub fn rewrite(&mut self, mut target: Id, lhs: Id, rhs: Id) -> Id {
+        let mut seen_rewritten = IndexSet::default();
+        for m in self.matches(lhs, target) {
+            let rewritten = self.instantiate(rhs, &m);
+            let rewritten = self.uf.find_mut(rewritten);
+            if !seen_rewritten.insert(rewritten) {
+                continue;
+            }
+            let union = self.union(target, rewritten);
+            assert_eq!(union, self.uf.find(target));
+            target = union;
+        }
+        target
+    }
+
+    pub fn rewrite2(&mut self, target: Id, rws: &[(Id, Id)]) -> Id {
+        let mut done = IndexSet::default();
+        let mut todo = vec![target];
+        while let Some(target) = todo.pop() {
+            if !done.insert(target) {
+                continue;
+            }
+            for &(lhs, rhs) in rws {
+                for m in self.matches(lhs, target) {
+                    todo.push(self.instantiate(rhs, &m));
+                }
+            }
+        }
+
+        done.iter().cloned().fold(target, |t, r| self.union(t, r))
+    }
+
+    pub fn to_fixed(&mut self, mut f: impl FnMut(&mut Self, usize)) {
+        let mut i = 0;
+        loop {
+            f(self, i);
+            let after = self.hashcons.len();
+            if after == i {
+                break;
+            }
+            i = after;
+        }
+    }
+
+    pub fn rewrite_all_to_fixed(&mut self, rewrites: &[(Id, Id)]) {
+        let mut rewrite_start = 0;
+        loop {
+            // Saturate rewrites on the frontier of newly-added nodes.
+            loop {
+                let rewrite_end = self.hashcons.len();
+                if rewrite_start == rewrite_end {
+                    break;
+                }
+                for id in (rewrite_start..rewrite_end).map(Id::new) {
+                    for &(lhs, rhs) in rewrites {
+                        self.rewrite(id, lhs, rhs);
+                    }
+                }
+                rewrite_start = rewrite_end;
+            }
+
+            let before_rebuild = self.hashcons.len();
+            self.rebuild_pairs();
+            let after_rebuild = self.hashcons.len();
+            if after_rebuild == before_rebuild {
+                break;
+            }
+
+            // Rebuild only appends new nodes; rewrite that tail next round.
+            rewrite_start = before_rebuild;
+        }
+    }
+
+    /// Rewrites only the subgraph reachable from `target`, visiting children
+    /// before parents. This does not perform a global rebuild pass.
+    pub fn rewrite_from_target_bottom_up(&mut self, target: Id, rewrites: &[(Id, Id)]) -> Id {
+        let mut memo: IndexMap<Id, Id> = IndexMap::default();
+        self.rewrite_from_target_bottom_up_impl(target, rewrites, &mut memo)
+    }
+
+    fn rewrite_from_target_bottom_up_impl(
+        &mut self,
+        target: Id,
+        rewrites: &[(Id, Id)],
+        memo: &mut IndexMap<Id, Id>,
+    ) -> Id {
+        let target = self.uf.find_mut(target);
+        if let Some(done) = memo.get(&target) {
+            return self.uf.find_mut(*done);
+        }
+
+        let expr = self.get(target).clone();
+        let mut current = match expr {
+            Expr::Var(_) | Expr::Const(_) => target,
+            Expr::Pair(a, b) => {
+                let a = self.rewrite_from_target_bottom_up_impl(a, rewrites, memo);
+                let b = self.rewrite_from_target_bottom_up_impl(b, rewrites, memo);
+                let rebuilt = self.add_expr(Expr::Pair(a, b));
+                self.union(target, rebuilt)
+            }
+            Expr::Union(a, b) => {
+                let a = self.rewrite_from_target_bottom_up_impl(a, rewrites, memo);
+                let b = self.rewrite_from_target_bottom_up_impl(b, rewrites, memo);
+                let rebuilt = self.add_expr(Expr::Union(a, b));
+                self.union(target, rebuilt)
+            }
+        };
+
+        loop {
+            let before = self.uf.find_mut(current);
+            current = self.rewrite2(current, rewrites);
+            let after = self.uf.find_mut(current);
+            current = after;
+            if after == before {
+                break;
+            }
+        }
+
+        memo.insert(target, current);
+        current
+    }
+
+    /// Rebuild pair nodes using canonical UF representatives for children.
+    /// This gives a lightweight congruence-closure step after unions.
+    #[inline(never)]
+    fn rebuild_pairs(&mut self) {
+        for id in self.ids(0) {
+            if let Expr::Pair(a, b) = self.get(id).clone() {
+                let a = self.uf.find_mut(a);
+                let b = self.uf.find_mut(b);
+                let Expr::Pair(x, y) = self.get(id) else {
+                    unreachable!()
+                };
+                if (a, b) == (*x, *y) {
+                    continue;
+                }
+                let rebuilt = self.add_expr(Expr::Pair(a, b));
+                self.union(id, rebuilt);
+            }
+        }
+    }
+
+    pub fn ids(&self, start: usize) -> impl Iterator<Item = Id> + 'static {
+        (start..self.hashcons.len()).map(Id::new)
+    }
+}
+
+// Display, extraction, and statistics
+impl Context {
     pub fn print(&self) {
         for (id, expr) in self.hashcons.iter().enumerate() {
             match expr {
@@ -158,7 +345,7 @@ impl Context {
     }
 
     pub fn print_extract(&self, depth: usize) {
-        for id in self.ids() {
+        for id in self.ids(0) {
             let extracted = self.extract(id, depth);
             let (first, rest) = extracted.split_first().unwrap();
             println!("{: >7}: {}", id, first);
@@ -196,18 +383,31 @@ impl Context {
         }
     }
 
-    pub fn ids(&self) -> impl Iterator<Item = Id> + 'static {
-        (0..self.hashcons.len()).map(Id::new)
-    }
-
-    pub fn rewrite(&mut self, mut target: Id, lhs: Id, rhs: Id) -> Id {
-        for m in self.matches(lhs, target) {
-            let rewritten = self.instantiate(rhs, &m);
-            let union = self.union(target, rewritten);
-            assert_eq!(union, self.uf.find(target));
-            target = union;
+    pub fn print_statistics(&self) {
+        println!("nodes: {}", self.hashcons.len());
+        println!(
+            "unions: {}",
+            self.hashcons
+                .iter()
+                .filter(|e| matches!(e, Expr::Union(_, _)))
+                .count()
+        );
+        let mut pairs: IndexMap<Id, Vec<Id>> = IndexMap::default();
+        for expr in &self.hashcons {
+            if let Expr::Pair(a, b) = expr {
+                pairs.entry(*a).or_default().push(*b);
+            }
         }
-        target
+        println!("pairs: {}", pairs.values().map(|v| v.len()).sum::<usize>());
+        pairs.sort_by_key(|_k, v| -(v.len() as isize));
+
+        println!("top 10 most common first elements of pairs:");
+        for (a, bs) in pairs.iter().take(10) {
+            println!("{}: {} pairs", a, bs.len());
+            for sexp in self.extract(*a, 5).into_iter().take(10) {
+                println!("  {}", sexp);
+            }
+        }
     }
 }
 
@@ -264,28 +464,44 @@ mod tests {
     fn simple_rewriting() {
         let mut ctx = Context::default();
 
-        // reassociate n things
-        let n = var_parse_or("n", 5);
+        // reassociate/commute n things
+        let n = var_parse_or("n", 4);
         let atoms: Vec<Id> = (0..n).map(|i| ctx.add(&format!("x{}", i))).collect();
         let mut f = |a, b| ctx.call("f", [a, b]);
         let iter = atoms.iter().cloned();
-        let input = iter.clone().reduce(|a, b| f(a, b)).unwrap();
-        let goal = iter.rev().reduce(|b, a| f(a, b)).unwrap();
+        let input = iter.clone().reduce(&mut f).unwrap();
+        let goal = iter.rev().reduce(&mut f).unwrap();
 
-        let lhs = ctx.add("(f (f ?x ?y) ?z)");
-        let rhs = ctx.add("(f ?x (f ?y ?z))");
+        let rws = &[
+            (ctx.add("(f (f ?x ?y) ?z)"), ctx.add("(f ?x (f ?y ?z))")),
+            (ctx.add("(f ?x ?y)"), ctx.add("(f ?y ?x)")),
+        ];
+        ctx.rewrite_all_to_fixed(rws);
 
-        let c_lhs = ctx.add("(f ?x ?y)");
-        let c_rhs = ctx.add("(f ?y ?x)");
+        // ctx.print_extract(5);
+        ctx.print_statistics();
 
-        for _ in 0..n {
-            // rewrite everywhere
-            for id in ctx.ids() {
-                ctx.rewrite(id, lhs, rhs);
-                ctx.rewrite(id, c_lhs, c_rhs);
-            }
-        }
-        ctx.print_extract(9);
+        assert_eq!(ctx.uf.find(input), ctx.uf.find(goal));
+    }
+
+    #[test]
+    fn simple_rewriting_bottom_up_target() {
+        let mut ctx = Context::default();
+
+        let n = var_parse_or("n", 4);
+        let atoms: Vec<Id> = (0..n).map(|i| ctx.add(&format!("x{}", i))).collect();
+        let mut f = |a, b| ctx.call("f", [a, b]);
+        let iter = atoms.iter().cloned();
+        let input = iter.clone().reduce(&mut f).unwrap();
+        let goal = iter.rev().reduce(&mut f).unwrap();
+
+        let rws = &[
+            (ctx.add("(f (f ?x ?y) ?z)"), ctx.add("(f ?x (f ?y ?z))")),
+            (ctx.add("(f ?x ?y)"), ctx.add("(f ?y ?x)")),
+        ];
+
+        ctx.rewrite_from_target_bottom_up(input, rws);
+        ctx.print_statistics();
 
         assert_eq!(ctx.uf.find(input), ctx.uf.find(goal));
     }
