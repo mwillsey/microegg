@@ -2,10 +2,12 @@
 An e-graph impl with acyclic union nodes, curried functions,
  and "variables" in the e-graph for native patterns.
 
+Acyclic is trickier than I thought, since you have to be careful not to pollute
+the e-graph with "stale" unions. I'm a little muddy about what "canonical" even
+means in this context.
 
 */
 
-use crate::sexp::{self, Sexp};
 use crate::util::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -20,48 +22,6 @@ pub enum Expr {
 pub struct Context {
     hashcons: IndexSet<Expr>,
     uf: UnionFind,
-}
-
-#[derive(Default)]
-struct UnionFind {
-    parent: Vec<Id>,
-}
-
-impl UnionFind {
-    pub fn find(&self, mut a: Id) -> Id {
-        while a != self.parent[a.usize()] {
-            a = self.parent[a.usize()];
-        }
-        a
-    }
-
-    fn find_mut(&mut self, mut a: Id) -> Id {
-        // First walk to the root.
-        let mut root = a;
-        while root != self.parent[root.usize()] {
-            root = self.parent[root.usize()];
-        }
-
-        // Then compress the full traversed path to the root.
-        while a != root {
-            let next = self.parent[a.usize()];
-            self.parent[a.usize()] = root;
-            a = next;
-        }
-
-        root
-    }
-
-    pub fn mkset(&mut self) -> Id {
-        let id = Id::new(self.parent.len());
-        self.parent.push(id);
-        id
-    }
-
-    pub fn reparent(&mut self, a: Id, new_parent: Id) {
-        let a = self.find_mut(a);
-        self.parent[a.usize()] = new_parent;
-    }
 }
 
 impl Context {

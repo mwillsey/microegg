@@ -3,6 +3,12 @@ Common, mostly uninteresting utilities used across the codebase.
  */
 use std::{ffi::OsStr, str::FromStr};
 
+pub mod sexp;
+pub use sexp::*;
+
+pub mod unionfind;
+pub use unionfind::UnionFind;
+
 pub use symbol_table::GlobalSymbol as Symbol;
 
 pub type IndexSet<K> = indexmap::IndexSet<K, rustc_hash::FxBuildHasher>;

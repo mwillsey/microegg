@@ -1,5 +1,5 @@
-use crate::{sexp::Sexp, util::*};
-use indexmap::{IndexMap, map::Entry};
+use crate::util::*;
+use indexmap::map::Entry;
 
 // The basics
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
