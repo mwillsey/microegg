@@ -104,6 +104,10 @@ impl FromStr for Sexp {
     }
 }
 
+pub fn sexp(s: &str) -> Sexp {
+    s.parse().unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

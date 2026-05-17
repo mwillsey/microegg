@@ -24,7 +24,7 @@ where
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, PartialOrd, Ord)]
 pub struct Id(u32);
 
 impl std::fmt::Display for Id {
@@ -50,6 +50,25 @@ where
 {
     a.extend(b);
     a
+}
+
+pub struct DisplayIter<I>(pub I, pub &'static str);
+
+impl<I: Clone + IntoIterator> std::fmt::Display for DisplayIter<I>
+where
+    I::Item: std::fmt::Display,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let DisplayIter(iter, sep) = self;
+        let mut iter = iter.clone().into_iter();
+        if let Some(item) = iter.next() {
+            write!(f, "{}", item)?;
+        }
+        for item in iter {
+            write!(f, "{sep}{}", item)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default)]
