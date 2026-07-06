@@ -21,7 +21,9 @@ impl std::fmt::Display for Node {
 
 #[derive(Default)]
 pub struct EGraph {
+    // maps e-nodes to the class they are in
     nodes: IndexMap<Node, Id>,
+    // the reverse map, from class to the e-nodes in that class
     rev: IndexMap<Id, Vec<Node>>,
     uf: UnionFind,
 }
@@ -33,21 +35,9 @@ impl EGraph {
         self.uf.find_mut(id)
     }
 
-    pub fn add_sexp(&mut self, sexp: &Sexp) -> Id {
-        match sexp {
-            Sexp::Atom(s) => self.add_node(Node(*s, vec![])),
-            Sexp::List(items) => {
-                let Some((Sexp::Atom(f), rest)) = items.split_first() else {
-                    panic!("expected atom at head of list");
-                };
-                let args = rest.iter().map(|s| self.add_sexp(s)).collect();
-                self.add_node(Node(*f, args))
-            }
-        }
-    }
-
+    /// Parse and add an s-exp in one step, useful for testing
     pub fn add(&mut self, s: &str) -> Id {
-        self.add_sexp(&s.parse().unwrap())
+        self.instantiate(&s.parse().unwrap(), &Subst::default())
     }
 
     pub fn union(&mut self, a: Id, b: Id) -> bool {
@@ -56,10 +46,7 @@ impl EGraph {
 
     pub fn nodes_in_class(&self, class: Id) -> impl Iterator<Item = &Node> {
         let class = self.uf.find(class);
-        match self.rev.get(&class) {
-            Some(nodes) => nodes.iter(),
-            None => [].iter(),
-        }
+        self.rev.get(&class).into_iter().flatten()
     }
 
     fn is_node_canonical(&self, node: &Node) -> bool {
@@ -88,6 +75,7 @@ impl EGraph {
             }
         }
 
+        // rebuild the reverse map from scratch
         self.rev.clear();
         for (node, id) in &self.nodes {
             self.rev.entry(*id).or_default().push(node.clone());
@@ -135,33 +123,37 @@ impl EGraph {
 }
 
 // e-matching
-
+// we will reuse sexps as patterns, where atoms starting with ? are treated as pattern variables
 impl EGraph {
     pub fn ematch(&self, pat: &Sexp, class: Id) -> Vec<Subst> {
-        self.ematch_rec(0, pat, class, Default::default())
+        self.ematch_rec(pat, class, Default::default())
     }
-    pub fn ematch_rec(&self, depth: usize, pat: &Sexp, class: Id, subst: Subst) -> Vec<Subst> {
+    pub fn ematch_rec(&self, pat: &Sexp, class: Id, subst: Subst) -> Vec<Subst> {
         match pat {
-            // all atoms in a pattern are considered variables
-            Sexp::Atom(name) => subst.with(*name, class).into_iter().collect(),
+            Sexp::Atom(name) => {
+                // all atoms beginning with ? are treated as pattern variables
+                let subst: Option<Subst> = if name.as_str().starts_with('?') {
+                    subst.with(*name, class)
+                } else {
+                    let leaf = Node(*name, vec![]);
+                    (self.nodes.get(&leaf) == Some(&class)).then(|| subst)
+                };
+                subst.into_iter().collect()
+            }
             Sexp::List(items) => {
                 let Some((Sexp::Atom(f), args)) = items.split_first() else {
                     panic!("expected atom at head of list");
                 };
-                let mut results = vec![];
-                for node in self.nodes_in_class(class) {
-                    let mut todo = vec![subst.clone()];
-                    if node.0 == *f && node.1.len() == args.len() {
-                        for (pa, na) in args.iter().zip(node.1.iter()) {
-                            todo = todo
-                                .into_iter()
-                                .flat_map(|subst| self.ematch_rec(depth + 1, pa, *na, subst))
-                                .collect();
-                        }
-                        results.extend(todo);
-                    }
-                }
-                results
+                self.nodes_in_class(class)
+                    .filter(|node| (node.0, node.1.len()) == (*f, args.len()))
+                    .flat_map(|node| {
+                        let init = vec![subst.clone()];
+                        args.iter().zip(&node.1).fold(init, |todo, (pa, &na)| {
+                            let rec = |subst| self.ematch_rec(pa, na, subst);
+                            todo.into_iter().flat_map(rec).collect()
+                        })
+                    })
+                    .collect()
             }
         }
     }
@@ -173,15 +165,14 @@ pub type Rewrite = (Sexp, Sexp);
 impl EGraph {
     pub fn instantiate(&mut self, pattern: &Sexp, subst: &Subst) -> Id {
         match pattern {
-            Sexp::Atom(name) => subst[*name],
+            Sexp::Atom(name) if name.as_str().starts_with('?') => subst[*name],
+            Sexp::Atom(name) => self.add_node(Node(*name, vec![])),
             Sexp::List(items) => {
                 let Some((Sexp::Atom(f), args)) = items.split_first() else {
                     panic!("expected atom at head of list");
                 };
-                let args = args
-                    .iter()
-                    .map(|arg| self.instantiate(arg, subst))
-                    .collect();
+                let rec = |arg| self.instantiate(arg, subst);
+                let args = args.iter().map(rec).collect();
                 self.add_node(Node(*f, args))
             }
         }
@@ -244,10 +235,10 @@ fn test_match() {
     eg.union(f2, f3);
     eg.rebuild();
 
-    let fxx_matches = eg.ematch(&sexp("(f x x)"), f1);
+    let fxx_matches = eg.ematch(&sexp("(f ?x ?x)"), f1);
     assert_eq!(fxx_matches.len(), 2);
 
-    let fxy_matches = eg.ematch(&sexp("(f x y)"), f1);
+    let fxy_matches = eg.ematch(&sexp("(f ?x ?y)"), f1);
     assert_eq!(fxy_matches.len(), 3);
 }
 
@@ -255,7 +246,7 @@ fn test_match() {
 fn test_ac_rewriting() {
     let mut eg = EGraph::default();
 
-    let n = var_parse_or("n", 5);
+    let n = var_parse_or("n", 7);
     let atoms = (0..n).map(|i| format!("x{}", i));
     let f = |acc, x| format!("(f {acc} {x})");
     let input = atoms.clone().reduce(f).unwrap();
@@ -264,8 +255,8 @@ fn test_ac_rewriting() {
     let input = eg.add(&input);
     let goal = eg.add(&goal);
     let rws = [
-        (sexp("(f (f x y) z)"), sexp("(f x (f y z))")),
-        (sexp("(f x y)"), sexp("(f y x)")),
+        (sexp("(f (f ?x ?y) ?z)"), sexp("(f ?x (f ?y ?z))")),
+        (sexp("(f ?x ?y)"), sexp("(f ?y ?x)")),
     ];
 
     eg.rewrite_to_fixed(&rws);
